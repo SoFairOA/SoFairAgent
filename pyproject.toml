@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sofairagent"
+dynamic = ["dependencies"]
+version = "0.0.1"
+requires-python = ">=3.12"
+authors = [
+  {name = "Martin Dočekal"},
+]
+description = "Agentic LLM for software mention extraction."
+readme = "README.md"
+keywords = ["software", "mention", "extraction", "agent", "llm"]
+
+[project.urls]
+Repository = "https://github.com/SoFairOA/SoFairAgent"
+
+[project.scripts]
+aicaller = "sofairagent.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sofairagent*"]
+exclude = ["tests*"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}

@@ -1,0 +1,14 @@
+classconfig~=1.0.11
+ollama
+openai
+pydantic
+json-repair
+intervaltree
+datasets
+jinja2
+validators
+ddgs
+whitespacetokenizer
+pyahocorasick
+torch
+transformers
