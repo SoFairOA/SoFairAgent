@@ -9,9 +9,43 @@ from transformers import AutoTokenizer
 from sofairagent.utils.template import Template, TemplateTransformer
 from sofairagent.verifier.model_factory import SequenceClassificationModelFactory
 from sofairagent.verifier.tokenizer_factory import TokenizerFactory
+from abc import ABC, abstractmethod
 
+class Verifier(ABC):
+    """
+    A functor that identifies software mentions from candidates.
+    """
+    input_template: Template = ConfigurableValue(user_default=LiteralScalarString("""
+    {{marked_input_text}}
 
-class Verifier:
+    {% if search_results | length > 0 %}
+    Search results for the target candidate are:
+    {% for r in search_results %}
+    {{r | model_dump_json}}
+    {%endfor %}
+    {% endif %}
+    """),
+                                                 desc="Jinja2 template for model input.",
+                                                 transform=TemplateTransformer()
+                                                 )
+
+    def __init__(self, input_template: Template):
+        """
+        Initializes the verifier with an input template.
+        """
+        self.input_template = input_template
+
+    @abstractmethod
+    def __call__(self, verify: Iterable[dict]) -> Generator[tuple[bool, float], None, None]:
+        """
+        Filters software mentions based on the model's predictions.
+
+        :param verify: A sequence of dicts with information for verification. Each dict must contain all keys used in the input_template.
+        :return: A generator of tuples (is_software_mention, probability).
+        """
+        ...
+
+class LocalModelVerifier(Verifier):
     """
     A class that identifies candidate documents for software mention extraction.
     """
@@ -27,19 +61,7 @@ class Verifier:
         voluntary=True
     )
     batch_size: int = ConfigurableValue("Batch size for processing documents.", user_default=8)
-    input_template: Template = ConfigurableValue(user_default=LiteralScalarString("""
-{{marked_input_text}}
 
-{% if search_results | length > 0 %}
-Search results for the target candidate are:
-{% for r in search_results %}
-{{r | model_dump_json}}
-{%endfor %}
-{% endif %}
-"""),
-                                                 desc="Jinja2 template for model input.",
-                                                 transform=TemplateTransformer()
-                                                 )
 
     def __init__(self,
                  model_factory: SequenceClassificationModelFactory,
@@ -59,6 +81,7 @@ Search results for the target candidate are:
         """
         Initializes the filter with a model and an optional threshold.
         """
+        super().__init__(input_template=input_template)
         self.model_factory = model_factory
         self.tokenizer_factory = tokenizer_factory
 
@@ -70,7 +93,7 @@ Search results for the target candidate are:
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_factory.model_path, use_fast=True,
                                                        cache_dir=self.model_factory.cache_dir) \
             if self.tokenizer_factory is None else self.tokenizer_factory.create()
-        self.input_template = input_template
+
 
     @torch.no_grad()
     def process_batch(self, batch: Iterable[dict]) -> list[tuple[bool, float]]:

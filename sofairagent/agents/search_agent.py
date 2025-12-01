@@ -2,12 +2,14 @@ import logging
 import logging
 import re
 import sys
+import uuid
 from collections import defaultdict
 from typing import Optional, Union, Literal
 
 import json_repair
 import validators
 from classconfig import ConfigurableSubclassFactory, ConfigurableValue, ConfigurableFactory
+from intervaltree import IntervalTree
 from pydantic import BaseModel, Field, ValidationError
 from ruamel.yaml.scalarstring import LiteralScalarString
 
@@ -176,6 +178,11 @@ class SearchAgent(Agent):
     use_reasoning: Optional[Union[bool, Literal['low', 'medium', 'high']]] = ConfigurableValue(
         user_default=False,
         desc="Whether to use reasoning in the verification step."
+    )
+    database_search: bool = ConfigurableValue(
+        user_default=True,
+        desc="Whether to search the software database for existing software mentions in database.",
+        voluntary=True
     )
     verify: bool = ConfigurableValue(
         user_default=True,
@@ -485,9 +492,11 @@ surface form: {{mention.surface_form}}"""),
         transform=TemplateTransformer()
     )
 
-    verifier: Verifier = ConfigurableFactory(
+    verifier: Optional[Verifier] = ConfigurableSubclassFactory(
         Verifier,
         "Verifier to use for verifying the candidates.",
+        user_default=None,
+        voluntary=True
     )
 
     def __post_init__(self):
@@ -534,7 +543,8 @@ surface form: {{mention.surface_form}}"""),
         for _, p in paragraphs:
             candidates.extend(self.find_candidates_llm(p))
 
-        candidates.extend([surface_form for _, surface_form in self.software_database.known_surface_forms_in_text(text)])
+        if self.database_search:
+            candidates.extend([surface_form for _, surface_form in self.software_database.known_surface_forms_in_text(text)])
         candidates = list(set(candidates))  # remove duplicates
 
         # convert candidate names to mentions, this can even blow up the number of mentions as we find all occurrences of the candidate in the text
@@ -610,7 +620,7 @@ surface form: {{mention.surface_form}}"""),
                 data={"text": text, "marked_text": marked_text, "mention": mention})},
         )
         request = self.request_factory(
-            custom_id="fill_additional_info",
+            custom_id=f"fill_additional_info_{uuid.uuid4()}",
             model=self.model,
             message=messages,
             options=self.requests_options,
@@ -697,7 +707,7 @@ surface form: {{mention.surface_form}}"""),
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": self.find_candidates_prompt.render({"text": text})})
         request = self.request_factory(
-            custom_id="mentions_extraction",
+            custom_id=f"mentions_extraction_{uuid.uuid4()}",
             model=self.model,
             message=messages,
             options=self.requests_options,
@@ -710,7 +720,7 @@ surface form: {{mention.surface_form}}"""),
         try:
             response = FindCandidatesResponse.model_validate(response)
         except ValidationError as e:
-            print("Validation error:", e)
+            print("Validation error:", e, file=sys.stderr)
             return []
 
         return response.candidates
@@ -768,7 +778,7 @@ surface form: {{mention.surface_form}}"""),
         :param mentions: list of mentions to add to the database
         """
         for m in mentions:
-            if m.confidence > self.accepted_confidences_for_database:
+            if m.confidence is not None and m.confidence > self.accepted_confidences_for_database:
                 context = self.get_context_window(text, m.start_offset, m.surface_form, self.context_window_for_database)
                 self.software_database.add_software(m.surface_form, context)
 
@@ -834,61 +844,6 @@ surface form: {{mention.surface_form}}"""),
                 res.append(c)
         return res
 
-    def verify_candidate(self, text: str, candidates: list[Mention], target: Mention, text_offset: int) -> bool:
-        """
-        Verifies a single software mention candidate in the text.
-
-        :param text: The input text to verify software mentions.
-        :param candidates: A list of software mentions candidates to verify.
-        :param target: The software mention candidate to verify.
-        :param text_offset: Start offset of the text in the document.
-        :return: True if the software mention is verified, False otherwise.
-        """
-
-        search_query = self.obtain_search_query(text, target)
-        search_results = self.search.search(search_query).results
-
-        marked_text = self.mark_orig_text(text, target, self.verify_open_tag, self.verify_close_tag, text_offset)
-
-        messages = [
-            {"role": "system", "content": self.verification_system_prompt.render(
-                data={"text": text, "marked_text": marked_text, "candidates": candidates, "target": target, "search_results": search_results, })},
-        ]
-        if self.verification_few_shot is not None:
-            for role, content in self.verification_few_shot:
-                messages.append({"role": role, "content": content})
-
-        messages.append(
-            {"role": "user", "content": self.verification_prompt.render(
-                data={"text": text, "marked_text": marked_text, "candidates": candidates, "target": target, "search_results": search_results})},
-        )
-        logging.info(f"verify_candidate | message: {messages[-1]['content']} | search_query: {search_query}")
-
-        request = self.request_factory(
-            custom_id="verify_candidate",
-            model=self.model,
-            message=messages,
-            options=self.requests_options,
-            response_format=VerifyCandidateResponse,
-            reasoning=self.use_reasoning,
-            fake_structured=self.fake_structured_format
-        )
-        api_output = self.model_api.process_single_request(request)
-        # get the tool calls from structured output, as it is not currently supported by ollama to use tool calling and structured output together
-        reply = api_output.response.get_raw_content()
-        reply = json_repair.loads(reply)
-        try:
-            reply = VerifyCandidateResponse.model_validate(reply)
-        except ValidationError as e:
-            print(
-                f"Warning: Could not validate repaired output in verify_candidate for candidate {target.surface_form}. Error: {e}",
-                file=sys.stderr)
-            return False
-
-        target.confidence = reply.confidence
-        logging.info(f"verify_candidate | confidence: {reply.confidence} | is_software: {reply.is_software}")
-        return reply.is_software
-
     def mark_orig_text(self, orig_text: str, candidate: Mention, open_tag: str, close_tag: str, align_offset: int = 0) -> str:
         """
         Marks the candidate surface form in the original text with specified tags.
@@ -913,7 +868,7 @@ surface form: {{mention.surface_form}}"""),
         :return: The search query.
         """
         request = self.request_factory(
-            custom_id="obtain_search_query",
+            custom_id=f"obtain_search_query_{uuid.uuid4()}",
             model=self.model,
             message=[
                 {"role": "system",
@@ -984,7 +939,7 @@ surface form: {{mention.surface_form}}"""),
         :return: repaired candidate
         """
         request = self.request_factory(
-            custom_id="repair_problems",
+            custom_id=f"repair_problems_{uuid.uuid4()}",
             model=self.model,
             message=[
                 {"role": "system", "content": self.repair_problems_prompt_system_prompt.render(
@@ -1199,7 +1154,7 @@ surface form: {{mention.surface_form}}"""),
         Works in place.
 
         :param text: original text from which the candidates were extracted
-        :param candidates: list of candidates to repair
+        :param c: list of candidates to repair
         :return: flag whether any URL was repaired
         """
         flag = False
@@ -1235,7 +1190,7 @@ surface form: {{mention.surface_form}}"""),
 
         # ask LLM to repair
         request = self.request_factory(
-            custom_id="repair_url",
+            custom_id=f"repair_url_{uuid.uuid4()}",
             model=self.model,
             message=[
                 {"role": "system", "content": self.url_repair_system_prompt.render(data={"text": text, "url": url})},
@@ -1252,3 +1207,73 @@ surface form: {{mention.surface_form}}"""),
         if validators.url(response):
             return response
         return url
+
+    @classmethod
+    def back_search_candidates(cls, text: str, input_text_mentions: list[Mention],
+                               all_document_mentions: list[Mention], context_window: int,
+                               return_mention: bool = False, case_insensitive: bool = True) -> list[
+        Candidate | Mention]:
+        """
+        Searches the text whether there exists mentions having the same surface form as the ones in all_document_mentions.
+
+        :param text: The input text
+        :param input_text_mentions: Mentions already found in the input text.
+        :param all_document_mentions: All mentions found in the document in the first pass.
+        :param context_window: Number of characters to use as context around the software mention
+        :param return_mention: If True, returns Mention objects instead of Candidate objects.
+        :param case_insensitive: If True, performs case insensitive search.
+        :return: Additional candidates found by back searching the text.
+        """
+
+        found_mentions = []
+        covered_intervals = IntervalTree()
+        for m in input_text_mentions:
+            covered_intervals.addi(m.start_offset, m.start_offset + len(m.surface_form))
+            if m.version:
+                covered_intervals.addi(m.version.start_offset, m.version.start_offset + len(m.version.surface_form))
+            for p in m.publisher:
+                covered_intervals.addi(p.start_offset, p.start_offset + len(p.surface_form))
+            for u in m.url:
+                covered_intervals.addi(u.start_offset, u.start_offset + len(u.surface_form))
+            for l in m.language:
+                covered_intervals.addi(l.start_offset, l.start_offset + len(l.surface_form))
+        covered_intervals.merge_overlaps()
+
+        text_search_in = text
+        if case_insensitive:
+            text_search_in = text.lower()
+        for i, m in enumerate(all_document_mentions):
+            try:
+                surface_form_search = m.surface_form
+                if case_insensitive:
+                    surface_form_search = m.surface_form.lower()
+                for match in re.finditer(r"\b" + re.escape(surface_form_search) + r"\b", text_search_in):
+                    start_index = match.start()
+                    surface_form = text[start_index:match.end()]
+                    if len(covered_intervals.overlap(start_index, start_index + len(surface_form))) == 0:
+                        if return_mention:
+                            found_mentions.append(Mention(
+                                surface_form=surface_form,
+                                context=cls.get_context_window(text, start_index, m.surface_form, context_window),
+                                start_offset=start_index,
+                                confidence=m.confidence,
+                                version=None,
+                                publisher=[],
+                                url=[],
+                                language=[]
+                            ))
+                        else:
+                            found_mentions.append(Candidate(
+                                id="second_pass_" + str(i),
+                                surface_form=surface_form,
+                                context=cls.get_context_window(text, start_index, m.surface_form, context_window),
+                                version=None,
+                                publisher=[],
+                                url=[],
+                                language=[]
+                            ))
+                        covered_intervals.addi(start_index, start_index + len(surface_form))
+
+            except ValueError:
+                continue
+        return found_mentions

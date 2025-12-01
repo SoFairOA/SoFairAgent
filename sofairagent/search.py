@@ -1,10 +1,12 @@
+import random
 import sqlite3
 import time
 from abc import ABC, abstractmethod
 from os import PathLike
-
+from typing import Optional
 from classconfig import ConfigurableValue, RelativePathTransformer, ConfigurableSubclassFactory, ConfigurableMixin
 from ddgs import DDGS
+from ddgs.exceptions import DDGSException
 from pydantic import BaseModel
 
 
@@ -56,11 +58,24 @@ class SearchCache(ABC):
         ...
 
     def __enter__(self):
-        raise NotImplementedError()
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        raise NotImplementedError()
+        pass
 
+class NoSearchCache(SearchCache):
+    """
+    Implements a no-op cache that does not store any search results.
+    """
+
+    def __len__(self):
+        return 0
+
+    def __getitem__(self, query: str) -> SearchOutput:
+        raise KeyError(f"No search results found for query: {query}")
+
+    def __setitem__(self, query: str, search_output: SearchOutput):
+        pass
 
 class LFUInMemorySearchCache(SearchCache):
     """
@@ -194,6 +209,7 @@ class Searcher(ABC, ConfigurableMixin):
         :param query: The search query.
         :return: A list of search results.
         """
+
         try:
             results = self.cache[query]
         except KeyError:
@@ -246,7 +262,7 @@ class DDGSSearcher(Searcher):
     Implements a searcher using DDGS library.
     """
     backend: str = ConfigurableValue(
-        "The search engine/ backend to use for DDGS search.",
+        "The search engine/ backend to use for DDGS search. You can use comma separated backends to randomly choose from them. It will provide all backends to ddgs, but in random order.",
         user_default="auto",
         voluntary=True,
     )
@@ -254,6 +270,7 @@ class DDGSSearcher(Searcher):
     def __post_init__(self):
         super().__post_init__()
         self.searcher = DDGS()
+        self.backend = [x.strip() for x in self.backend.split(",")] if "," in self.backend else self.backend
 
     def _no_cache_search(self, query: str) -> SearchOutput:
         """
@@ -262,7 +279,13 @@ class DDGSSearcher(Searcher):
         :param query: The search query.
         :return: A list of search results.
         """
-        results = self.searcher.text(query, max_results=self.max_results, backend=self.backend)
+
+        try:
+            backend = self.backend if isinstance(self.backend, str) else ", ".join(random.sample(self.backend, len(self.backend)))
+            results = self.searcher.text(query, max_results=self.max_results, backend=backend)
+        except DDGSException:
+            results = []
+
         return SearchOutput(
             results=[
                 SearchResult(

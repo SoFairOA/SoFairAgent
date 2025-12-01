@@ -5,7 +5,7 @@ from typing import Sequence, Optional
 import json_repair
 from classconfig import ConfigurableFactory, ConfigurableValue, ConfigurableSubclassFactory, ConfigurableMixin, Config
 from classconfig.transforms import EnumTransformer
-from intervaltree import IntervalTree
+from intervaltree import IntervalTree, Interval
 from pydantic import BaseModel, parse_obj_as, TypeAdapter, ValidationError
 from ruamel.yaml.scalarstring import LiteralScalarString
 from tqdm import tqdm
@@ -119,10 +119,32 @@ Please create a search query for the mention."""),
         user_default="orig_id",
         voluntary=True
     )
+    add_gt_candidates: bool = ConfigurableValue(
+        desc="Whether to add all ground truth software mentions from the original dataset as candidates to be verified.",
+        user_default=True,
+        voluntary=True
+    )
 
+    context_window: int = ConfigurableValue(
+        desc="Number of characters of context to include before and after the software mention when creating ground truth candidates.",
+        user_default=50,
+        voluntary=True
+    )
+    world_size: int = ConfigurableValue(
+        desc="World size for distributed processing. If 1, no distributed processing is used.",
+        user_default=1,
+        voluntary=True
+    )
+    rank: int = ConfigurableValue(
+        desc="Rank of the current process for distributed processing.",
+        user_default=0
+    )
     def __post_init__(self):
         self.original_ds = self.original_dataset.get_split(self.original_dataset_split)
         self.candidate_ds = self.candidate_dataset.get_split(self.candidate_dataset_split)
+        if self.world_size > 1:
+            self.candidate_ds = self.candidate_ds.shard(self.world_size, self.rank)
+
         self.request_factory = self.model_api.get_request_factory()
 
     def __enter__(self):
@@ -194,7 +216,16 @@ Please create a search query for the mention."""),
             response_format=SearchQueryResponse,
             fake_structured=self.fake_structured_format
         )
-        raw_response = self.model_api.process_single_request(request).response.get_raw_content()
+        for _ in range(3):
+            try:
+                raw_response = self.model_api.process_single_request(request).response.get_raw_content()
+                break
+            except Exception as e:
+                print(f"Error obtaining search query: {e}. Retrying...", file=sys.stderr)
+        else:
+            print(f"Failed to obtain search query after 3 attempts. Returning surface form as query.", file=sys.stderr)
+            return candidate.surface_form
+
         try:
             response = json_repair.loads(raw_response)
         except RecursionError:
@@ -255,6 +286,31 @@ Please create a search query for the mention."""),
                 assert orig_sample[self.id_field] == cand_sample[self.id_field], f"Original sample ID {orig_sample['id']} does not match candidate sample ID {cand_sample['id']}"
                 software_char_intervals: IntervalTree = self.obtain_software_char_intervals(orig_sample[self.original_dataset_token_start_offset_field], orig_sample[self.original_dataset_bio_tags_field])
                 candidates = TypeAdapter(list[Mention]).validate_python(cand_sample[self.candidates_field])
+
+                if self.add_gt_candidates:
+                    # add all ground truth software mentions from the original dataset as candidates
+                    gt_candidates = []
+                    for interval in software_char_intervals:
+                        surface_form = orig_sample[self.original_dataset_text_field][interval.begin:interval.end]
+                        gt_candidates.append(Mention(
+                            surface_form=surface_form,
+                            context=orig_sample[self.original_dataset_text_field][max(0, interval.begin - self.context_window):min(len(orig_sample[self.original_dataset_text_field]), interval.end + self.context_window)],
+                            start_offset=interval.begin,
+                            confidence=None,
+                            version=None,
+                            publisher=[],
+                            url=[],
+                            language=[]
+                        ))
+                    # merge candidates
+                    existing_intervals = IntervalTree(
+                        Interval(cand.start_offset, cand.start_offset + len(cand.surface_form)) for cand in candidates
+                    )
+                    for gt_cand in gt_candidates:
+                        gt_interval = (gt_cand.start_offset, gt_cand.start_offset + len(gt_cand.surface_form))
+                        if not existing_intervals.overlap(gt_interval[0], gt_interval[1]):
+                            candidates.append(gt_cand)
+
                 text = orig_sample[self.original_dataset_text_field]
                 paragraphs = self.paragraphs_intervals(text)
                 align_offset = 0

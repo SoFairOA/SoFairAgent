@@ -7,25 +7,22 @@ import random
 import sys
 import traceback
 from argparse import ArgumentParser
-from typing import Sequence, Optional
-
 from classconfig import Config, ConfigurableFactory, ConfigurableMixin, ConfigurableSubclassFactory, ConfigurableValue, \
-    YAML
+    YAML, CreatableMixin
 from intervaltree import IntervalTree, Interval
 from tqdm import tqdm
+from typing import Sequence, Optional
 from whitespacetokenizer import whitespace_tokenizer
 
-from sofairagent.agents import Agent, Mention, SearchAgent, SimpleAgent
+from sofairagent.agents import Agent, Mention, SearchAgent
 from sofairagent.etl.dataset import DatasetFactory
 from sofairagent.verifier.create_train_dataset import CreateTrainDatasetWorkflow
 
 
-class ExtractDatasetWorkflow(ConfigurableMixin):
+class BIOConversionMixin:
     """
-    Extracts software mentions from text.
+    Mixin class for converting software mentions to BIO tags.
     """
-
-    agent: Agent = ConfigurableSubclassFactory(Agent, "Agent for extraction.", user_default=SearchAgent)
 
     bio_dict: Optional[dict[str, int]] = ConfigurableValue(
         "Dictionary mapping BIO tags to integers. Required if bio_output is True.",
@@ -44,6 +41,81 @@ class ExtractDatasetWorkflow(ConfigurableMixin):
         },
         voluntary=True
     )
+
+    def convert_mentions_to_bio(self, mentions: list[Mention], start_offsets: Sequence[int]) -> list[int]:
+        """
+        Converts the extracted mentions to BIO tags.
+
+        :param mentions: List of extracted software mentions.
+        :param start_offsets: Start offsets of tokens in the text.
+        :return: List of BIO tags for each token in sequence
+        """
+
+        labels = [self.bio_dict["O"]] * len(start_offsets)
+        token_search = IntervalTree(
+            Interval(s, start_offsets[i + 1] if i + 1 < len(start_offsets) else math.inf, i) for i, s in
+            enumerate(start_offsets))
+
+        for m in mentions:
+            if m.version:
+                self.search_and_mark(token_search, labels, m.version.start_offset,
+                                     m.version.start_offset + len(m.version.surface_form), "VERSION")
+            for publisher in m.publisher:
+                self.search_and_mark(token_search, labels, publisher.start_offset,
+                                     publisher.start_offset + len(publisher.surface_form), "PUBLISHER")
+            for url in m.url:
+                self.search_and_mark(token_search, labels, url.start_offset, url.start_offset + len(url.surface_form),
+                                     "URL")
+            for language in m.language:
+                self.search_and_mark(token_search, labels, language.start_offset,
+                                     language.start_offset + len(language.surface_form), "LANGUAGE")
+
+            # Mark the main software mention last to give it priority in case of overlaps
+            self.search_and_mark(token_search, labels, m.start_offset, m.start_offset + len(m.surface_form), "SOFTWARE")
+
+        return labels
+
+    def search_and_mark(self, token_search: IntervalTree, labels: list[int], start_offset: int, end_offset: int,
+                        t: str):
+        """
+        Searches for the tokens overlapping with the given character offsets and marks them with the given BIO tags.
+
+        :param token_search: IntervalTree with token start and end offsets and their indices
+        :param labels: sequence of labels that will be modified in-place
+        :param start_offset: character start offset
+        :param end_offset: character end offset (exclusive)
+        :param t: type of the entity USE UPPERCASE (e.g., SOFTWARE, VERSION, URL, etc.)
+        :raises ValueError: If token_search is invalid
+        """
+        intervals = sorted(token_search.overlap(start_offset, end_offset), key=lambda x: x[-1])
+        if not intervals:
+            logging.warning(f"Could not find tokens for entity {t} with character offsets {start_offset}-{end_offset}.")
+            return
+
+        token_start_offset = intervals[0][-1]
+        token_end_offset = intervals[-1][-1] + 1  # exclusive
+        self.mark(labels, token_start_offset, token_end_offset, t)
+
+    def mark(self, labels: list[int], start_offset: int, end_offset: int, t: str):
+        """
+        Marks the tokens with the given BIO tags.
+
+        :param labels: sequence of labels that will be modified in-place
+        :param start_offset: token start offset
+        :param end_offset: token end offset (exclusive)
+        :param t: type of the entity USE UPPERCASE (e.g., SOFTWARE, VERSION, URL, etc.)
+        """
+        labels[start_offset] = self.bio_dict[f"B-{t}"]
+        for i in range(start_offset + 1, end_offset):
+            labels[i] = self.bio_dict[f"I-{t}"]
+
+
+class ExtractDatasetWorkflow(ConfigurableMixin, BIOConversionMixin):
+    """
+    Extracts software mentions from text.
+    """
+
+    agent: Agent = ConfigurableSubclassFactory(Agent, "Agent for extraction.", user_default=SearchAgent)
 
     def __enter__(self):
         self.agent.__enter__()
@@ -140,72 +212,6 @@ class ExtractDatasetWorkflow(ConfigurableMixin):
 
         return mentions
 
-    def convert_mentions_to_bio(self, mentions: list[Mention], start_offsets: Sequence[int]) -> list[int]:
-        """
-        Converts the extracted mentions to BIO tags.
-
-        :param mentions: List of extracted software mentions.
-        :param start_offsets: Start offsets of tokens in the text.
-        :return: List of BIO tags for each token in sequence
-        """
-
-        labels = [self.bio_dict["O"]] * len(start_offsets)
-        token_search = IntervalTree(
-            Interval(s, start_offsets[i + 1] if i + 1 < len(start_offsets) else math.inf, i) for i, s in
-            enumerate(start_offsets))
-
-        for m in mentions:
-            self.search_and_mark(token_search, labels, m.start_offset, m.start_offset + len(m.surface_form), "SOFTWARE")
-
-            if m.version:
-                self.search_and_mark(token_search, labels, m.version.start_offset,
-                                     m.version.start_offset + len(m.version.surface_form), "VERSION")
-            for publisher in m.publisher:
-                self.search_and_mark(token_search, labels, publisher.start_offset,
-                                     publisher.start_offset + len(publisher.surface_form), "PUBLISHER")
-            for url in m.url:
-                self.search_and_mark(token_search, labels, url.start_offset, url.start_offset + len(url.surface_form),
-                                     "URL")
-            for language in m.language:
-                self.search_and_mark(token_search, labels, language.start_offset,
-                                     language.start_offset + len(language.surface_form), "LANGUAGE")
-
-        return labels
-
-    def search_and_mark(self, token_search: IntervalTree, labels: list[int], start_offset: int, end_offset: int,
-                        t: str):
-        """
-        Searches for the tokens overlapping with the given character offsets and marks them with the given BIO tags.
-
-        :param token_search: IntervalTree with token start and end offsets and their indices
-        :param labels: sequence of labels that will be modified in-place
-        :param start_offset: character start offset
-        :param end_offset: character end offset (exclusive)
-        :param t: type of the entity USE UPPERCASE (e.g., SOFTWARE, VERSION, URL, etc.)
-        :raises ValueError: If token_search is invalid
-        """
-        intervals = sorted(token_search.overlap(start_offset, end_offset), key=lambda x: x[-1])
-        if not intervals:
-            logging.warning(f"Could not find tokens for entity {t} with character offsets {start_offset}-{end_offset}.")
-            return
-
-        token_start_offset = intervals[0][-1]
-        token_end_offset = intervals[-1][-1] + 1  # exclusive
-        self.mark(labels, token_start_offset, token_end_offset, t)
-
-    def mark(self, labels: list[int], start_offset: int, end_offset: int, t: str):
-        """
-        Marks the tokens with the given BIO tags.
-
-        :param labels: sequence of labels that will be modified in-place
-        :param start_offset: token start offset
-        :param end_offset: token end offset (exclusive)
-        :param t: type of the entity USE UPPERCASE (e.g., SOFTWARE, VERSION, URL, etc.)
-        """
-        labels[start_offset] = self.bio_dict[f"B-{t}"]
-        for i in range(start_offset + 1, end_offset):
-            labels[i] = self.bio_dict[f"I-{t}"]
-
     @classmethod
     def load(cls, path_to_config: Optional[str]) -> "ExtractDatasetWorkflow":
         """
@@ -231,6 +237,20 @@ def extract_dataset(args):
             path=args.dataset,
             name=args.subset,
         ).create(args.split)
+
+        from_idx = args.__dict__.get("from", 0)
+        to_idx = args.to if args.to is not None else len(dataset)
+        if from_idx > 0 or to_idx < len(dataset):
+            dataset = dataset.select(range(from_idx, to_idx))
+
+        if args.world_size > 1 and args.rank >= 0:
+            # Distributed extraction
+            total_size = len(dataset)
+            per_worker = (total_size + args.world_size - 1) // args.world_size
+            start_idx = args.rank * per_worker
+            end_idx = min(start_idx + per_worker, total_size)
+            dataset = dataset.select(range(start_idx, end_idx))
+
         workflow(
             sample_ids=dataset[args.id_field],
             texts=dataset[args.text_field],
@@ -303,6 +323,55 @@ def split_verifier_dataset(args: argparse.Namespace):
                 raise ValueError(f"orig_id {record['orig_id']} not found in any split")
 
 
+class BackSearchWorkflow(ConfigurableMixin, BIOConversionMixin, CreatableMixin):
+    """
+    Performs back search to find already extracted mentions in given text on different positions.
+    """
+
+    def __call__(self, args: argparse.Namespace):
+        dataset = DatasetFactory(
+            path=args.dataset,
+            name=args.subset,
+        ).create(args.split)
+
+        id_2_sample = {dataset[args.id_field][i]: dataset[i] for i in range(len(dataset))}
+        new_mentions_count = 0
+        with open(args.results_file) as f:
+            for line in f:
+                record = json.loads(line)
+                sample_id = record["id"]
+                text = id_2_sample[sample_id][args.text_field]
+
+                mentions = [Mention.model_validate(m) for m in record["mentions"]]
+
+                # let's select only mentions with capitalized first letter to avoid too many false positives
+                cap_mentions = [m for m in mentions if m.surface_form[0].isupper() and len(m.surface_form) > 3]
+
+                found = SearchAgent.back_search_candidates(text, cap_mentions, cap_mentions, args.context_window,
+                                                           return_mention=True)
+                new_mentions_count += len(found)
+                # add found mentions to the record
+                mentions.extend(found)
+                mentions = sorted(mentions, key=lambda x: x.start_offset)
+                record["mentions"] = [m.model_dump() for m in mentions]
+                if "labels" in record:
+                    labels = self.convert_mentions_to_bio(mentions, record["start_offsets"])
+                    record["labels"] = labels
+
+                print(json.dumps(record, ensure_ascii=False), flush=True)
+
+        print(f"Found {new_mentions_count} new mentions during back search.", file=sys.stderr)
+
+
+def back_search(args: argparse.Namespace):
+    """
+    Performs back search to find already extracted mentions in given text on different positions.
+
+    :param args: User arguments.
+    """
+
+    BackSearchWorkflow.create(args.config)(args)
+
 def create_config(args: argparse.Namespace):
     """
     Method for generating configuration for workflow.
@@ -349,15 +418,43 @@ def main():
     extract_dataset_parser.add_argument("-c", "--config", help="Path to the configuration file.")
     extract_dataset_parser.add_argument("-b", "--bio", help="If set, outputs BIO tags for each token in the text.",
                                         action="store_true")
+    extract_dataset_parser.add_argument("--from", help="Starting index of samples to process.", type=int, default=0)
+    extract_dataset_parser.add_argument("--to", help="Ending index of samples to process.", type=int, default=None)
+    extract_dataset_parser.add_argument("-w", "--world_size", help="Number of processes for distributed extraction. -1 means no distribution.", type=int, default=-1)
+    extract_dataset_parser.add_argument("-r", "--rank", help="Rank of the current process for distributed extraction. -1 means no distribution.", type=int, default=-1)
     extract_dataset_parser.set_defaults(func=extract_dataset)
 
     test_extract_parser = subparsers.add_parser("test_extract", help="Allows to test extraction on custom text.")
     test_extract_parser.add_argument("-c", "--config", help="Path to the configuration file.")
     test_extract_parser.set_defaults(func=test_extract)
 
+    back_search_parser = subparsers.add_parser("back_search",
+                                               help="Performs back search to find already extracted mentions in given text on different positions. Results will be printed to stdout.")
+    back_search_parser.add_argument("dataset",
+                                    help="Name/path of Hugging Face dataset.",
+                                    default="SoFairOA/sofair_dataset")
+    back_search_parser.add_argument("results_file", help="Path to the file with previously extracted results.")
+
+    back_search_parser.add_argument("-i", "--id_field",
+                                    help="Field name with sample ids in the dataset.",
+                                    default="id")
+    back_search_parser.add_argument("-t", "--text_field",
+                                    help="Field name with text in the dataset. The text should be plain text with single paragraphs per line.",
+                                    default="text")
+    back_search_parser.add_argument("-u", "--subset",
+                                    help="Subset of the dataset to use. If not provided, the default one is used",
+                                    default=None)
+    back_search_parser.add_argument("-s", "--split", help="Split of the gold dataset.", default="test")
+    back_search_parser.add_argument("--context_window", type=int, default=100,
+                                    help="Number of characters to use as context around the software mention.")
+    back_search_parser.add_argument("-c", "--config", help="Path to the configuration file.", required=True)
+    back_search_parser.set_defaults(func=back_search)
+
     train_dataset_verifier_parser = subparsers.add_parser("create_train_dataset_verifier", help="Creates a dataset for training a verifier model.")
     train_dataset_verifier_parser.add_argument("config", help="Path to the configuration file.")
     train_dataset_verifier_parser.add_argument("output", help="Path to save the dataset.")
+    train_dataset_verifier_parser.add_argument("--world_size", type=int, default=1, help="Number of parallel workers to use.")
+    train_dataset_verifier_parser.add_argument("--rank", type=int, default=0, help="Rank of the current worker.")
     train_dataset_verifier_parser.set_defaults(func=create_train_dataset_verifier)
 
     split_verifier_dataset_parser = subparsers.add_parser("split_verifier_dataset",
