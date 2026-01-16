@@ -1,3 +1,4 @@
+import copy
 import logging
 import logging
 import re
@@ -594,7 +595,7 @@ surface form: {{mention.surface_form}}"""),
             try:
                 self.fill_mention(text, m)
             except ValueError as e:
-                print(f"Warning: {e}", file=sys.stderr)
+                logging.info(f"Failed to fill mention '{m}': {e}")
 
     def fill_mention(self, text: str, mention: Mention):
         """
@@ -629,15 +630,16 @@ surface form: {{mention.surface_form}}"""),
             fake_structured=self.fake_structured_format
         )
         api_output = self.model_api.process_single_request(request)
-        # get the tool calls from structured output, as it is not currently supported by ollama to use tool calling and structured output together
+        if api_output.response is None:
+            logging.info(f"Failed to fill additional information for mention '{mention}': {api_output}")
+            return
+
         reply = api_output.response.get_raw_content()
         reply = json_repair.loads(reply)
         try:
             reply = FillAdditionalInfoResponse.model_validate(reply)
         except ValidationError as e:
-            print(
-                f"Warning: Could not validate the output of the model for filling additional information for mention '{mention.surface_form}': {e}",
-                file=sys.stderr)
+            logging.info(f"Failed to fill additional information for mention '{mention}': {e}")
             return
 
         # convert reply to candidate
@@ -675,23 +677,24 @@ surface form: {{mention.surface_form}}"""),
             try:
                 mention.version = assemble_additional_info(additional_info.version.context, additional_info.version.surface_form, "Version")
             except ValueError as e:
-                print(f"Warning: {e}", file=sys.stderr)
+                logging.info(f"Failed to fill additional information for mention '{mention}': {e}")
 
         for p in additional_info.publisher:
             try:
                 mention.publisher.append(assemble_additional_info(p.context, p.surface_form, "Publisher"))
             except ValueError as e:
-                print(f"Warning: {e}", file=sys.stderr)
+                logging.info(f"Failed to fill additional information for mention '{mention}': {e}")
         for u in additional_info.url:
             try:
                 mention.url.append(assemble_additional_info(u.context, u.surface_form, "URL"))
             except ValueError as e:
-                print(f"Warning: {e}", file=sys.stderr)
+                logging.info(f"Failed to fill additional information for mention '{mention}': {e}")
+
         for l in additional_info.language:
             try:
                 mention.language.append(assemble_additional_info(l.context, l.surface_form, "Language"))
             except ValueError as e:
-                print(f"Warning: {e}", file=sys.stderr)
+                logging.info(f"Failed to fill additional information for mention '{mention}': {e}")
 
     def find_candidates_llm(self, text: str) -> list[str]:
         """
@@ -720,7 +723,7 @@ surface form: {{mention.surface_form}}"""),
         try:
             response = FindCandidatesResponse.model_validate(response)
         except ValidationError as e:
-            print("Validation error:", e, file=sys.stderr)
+            logging.info(f"Could not parse find candidates response: {response}, error: {e}")
             return []
 
         return response.candidates
@@ -739,7 +742,7 @@ surface form: {{mention.surface_form}}"""),
                 mention = self.convert_candidate_to_mention(text, c)
                 mentions.extend(mention)
             except ValueError as e:
-                print(f"Warning: {e}", file=sys.stderr)
+                logging.info(f"Failed to convert candidate: {c} to mention: {mention}: {e}")
         return mentions
 
     def convert_candidate_to_mention(self, text: str, candidate: str) -> list[Mention]:
@@ -938,6 +941,7 @@ surface form: {{mention.surface_form}}"""),
         :param problems: list of problems identified for the candidate
         :return: repaired candidate
         """
+
         request = self.request_factory(
             custom_id=f"repair_problems_{uuid.uuid4()}",
             model=self.model,
@@ -951,9 +955,13 @@ surface form: {{mention.surface_form}}"""),
             response_format=Candidate,
             fake_structured=self.fake_structured_format
         )
-        response = self.model_api.process_single_request(request).response.get_raw_content()
-        response = json_repair.loads(response)
-        response = Candidate.model_validate(response)
+        try:
+            response = self.model_api.process_single_request(request).response.get_raw_content()
+            response = json_repair.loads(response)
+            response = Candidate.model_validate(response)
+        except Exception:
+            logging.info(f"Failed to repair candidate: {candidate}")
+            response = copy.deepcopy(candidate)
         return response
 
     def repair_non_existing_context(self, text: str, c: Candidate) -> bool:

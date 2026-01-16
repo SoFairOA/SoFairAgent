@@ -1,0 +1,299 @@
+agent:  # Agent for extraction.
+  cls: SearchAgent  # name of class that is subclass of Agent
+  config: # configuration for defined class
+    model_api: # API to use for the model.
+      cls: OllamaAPI  # name of class that is subclass of API
+      config: # configuration for defined class
+        api_key: ollama  # API key.
+        base_url: http://athena19.fit.vutbr.cz:11431 # Base URL for API.
+        pool_interval: 300 # Interval in seconds for checking the status of the batch request.
+        process_requests_interval: 1 # Interval in seconds between sending requests when processed synchronously.
+        logger: # Logger for API requests and responses.
+          cls: APISQLiteLogger  # name of class that is subclass of APILogger
+          config: # configuration for defined class
+            db_path: api_logs.sqlite3  # Path to the SQLite database file for logging.
+        n_tries: 3 # Number of tries for each request in case of failure.
+    model: llama3.3:70b # Model name to use for the API.
+    requests_options: # Request options for the model. Not all options are available for all APIs.
+      temperature: 1.0  # Temperature of the model. Controls randomness in the output.
+      logprobs: false # Whether to return log probabilities of the output tokens or not. If true, returns the log probabilities of each output token returned in the content of message.
+      max_completion_tokens: 2048 # Maximum number of tokens generated.
+      num_ctx: 8192 # Maximum number of context tokens to use.
+    search: # Searcher to use for the agent.
+      cls: DDGSSearcher  # name of class that is subclass of Searcher
+      config: # configuration for defined class
+        cache: # Cache for search results.
+          cls: SQLiteSearchCache  # name of class that is subclass of SearchCache
+          config: # configuration for defined class
+            db_path: search_queries.sqlite3  # Path to the SQLite database file for caching search results.
+        max_results: 10 # Maximum number of results to return for a search query.
+        wait_between_requests: 5 # Time in seconds to wait between requests to avoid rate limiting.
+        backend: duckduckgo,bing,mojeek # The search engine/ backend to use for DDGS search.
+    software_database: # Software database to use for checking existing software mentions.
+      db_path: software.sqlite3 # Path to the SQLite database file.
+      known_threshold: 3 # Threshold for considering a software as known based on occurrences.
+    max_repairs: 3 # Maximum number of trials to repair the candidates contexts.
+    use_reasoning: false # Whether to use reasoning in the verification step.
+    database_search: true # Whether to search the software database for existing software mentions in database.
+    verify: true # Whether to verify the candidates after finding them.
+    fill: true # Whether to fill additional information for the verified mentions.
+    find_candidates_system_prompt: |
+      Your task is to find software mentions in the text from scientific papers. 
+      Extract any named entity that resembles a software name, even if it is not a known software. If you are unsure, it is better to include a candidate than to miss one.
+# System prompt to find software mentions candidates in the text. 
+    find_candidates_few_shot: # Few-shot examples for finding software mentions candidates.
+    - -
+        user
+      - |-
+        The text is:
+
+        We used the Ollama inference API [https://ollama.com/docs/api] to run the model locally.
+
+        Please extract all software mentions from the text.
+    - - assistant
+      - |
+        {
+            "candidates": ["Ollama"]
+        }
+    - - user
+      - |-
+        The text is:
+
+        Based on list of known public managers, we used the snowballing technique (Myers & Newman, 2007) to recruit new respondents. We first made contact with them by telephone, informing them about the study goals; shortly thereafter, we sent them a personalized link to the software Q-software with specific instructions on how to do the sorting exercise online.
+
+        Please extract all software mentions from the text.
+    - - assistant
+      - |
+        {
+            "candidates": ["Q-software"]
+        }
+    - - user
+      - |-
+        The text is:
+
+        We used the open-source Transformers library developed by Hugging Face (Wolf et al., 2020) to implement and train our models. Our training code MLTrainer is available at https://example.com, the whole code base is implemented using Python.
+
+        Please extract all software mentions from the text.
+    - - assistant
+      - |
+        {
+            "candidates": ["Transformers", "MLTrainer"]
+        }
+    find_candidates_prompt: |-
+      The text is:
+
+      {{text}}
+
+      Please extract all software mentions from the text.
+# Jinja2 template for the prompt to find software mentions candidates in the text.
+    url_repair_system_prompt: |-
+      You are a URL repair agent. Your task is to repair the given URL extracted from the text from a scientific paper.
+      You will be provided with text from which the URL was extracted and the URL itself.
+      Make sure that the URL is not just valid, but that it points to the correct resource, i.e., the resource that was mentioned in the text
+      Try to repair it if it is not a valid URL. If you cannot repair it, return an empty string.
+# System prompt to repair URLs in the candidates. 
+    url_repair_prompt: |-
+      The text is:
+
+      {{text}}
+
+      The URL is: '{{url}}'
+      Please repair the URL if it is not valid or return an empty string.
+# Jinja2 template for the prompt to repair URLs in the candidates. 
+    repair_problems_prompt_system_prompt: |-
+      You are a software mention extraction agent. Your task is to find software mentions in the text from scientific papers. 
+      You have previously extracted software mentions candidates from the text, but some of them have problems. 
+      Please fix them using the text from which the software mention candidate was extracted.
+# System prompt to repair candidates with identified problems. 
+    repair_problems_prompt: |-
+      The following problems were identified for the given candidate.
+      Text:
+
+      {{text}}
+
+      Problematic candidate:
+      {{candidate | model_dump_json }}
+
+      Problems:
+      {% for p in problems %}
+              - {{p}}
+      {% endfor %}
+
+      Please fix all problems of the candidate.
+# Jinja2 template for the prompt to repair candidates with identified problems. 
+    obtain_search_query_system_prompt: |-
+      You are a software mention extraction agent. You are about to search for a software mention in a web search engine.
+      To get the best search results, you need to create a good search query for which you will obtain the best results that will help you to verify whether given mention is a software or not.
+      You will be provided with the text from which the mention was extracted and the mention itself.
+      Please create a search query that will help you to find out whether the mention is a software or not.
+      Make sure that the query is not too broad, but also not too specific.
+      If you think that the context of the mention will help with the search, include it in the query.
+# System prompt to create a search query for the search engine. 
+    obtain_search_query_prompt: |-
+      The text is:
+
+      {{text}}
+
+      The mention to search for is: 
+
+      {{candidate | model_dump_json }}
+
+      Please create a search query for the mention.
+# Jinja2 template for the prompt to create a search query for the search engine. 
+    context_window_for_database: 100 # Number of characters to use as context around the software mention for storing validate software to the software database.
+    accepted_confidences_for_database: 0.9 # List of accepted confidence levels for storing verified software mentions to the software database.
+    fake_structured_format: # If set, it will be used to fake the structured response format for the model.
+    paragraph_separator: "\n" # Separator to use between paragraphs when splitting the text into smaller chunks.
+    verify_open_tag: ' <verify> ' # String to mark the beginning of a software mention in the text.
+    verify_close_tag: ' </verify> ' # String to mark the end of a software mention in the text.
+    mention_open_tag: ' <mention> ' # String to mark the beginning of a software mention in the text.
+    mention_close_tag: ' </mention> ' # String to mark the end of a software mention in the text.
+    fill_mention_system_prompt: |
+      Your task is to extract additional information about the software mention from the text. The additional information are:
+      "version" -  It can be a number, an identifier or a date. It is expected that a mentioned software has only one version.
+      "publisher" - It is usually the organization or the company owning the software or having developed the software. It is expected that a mentioned software has only one publisher in the same mention context a most, but several is possible.
+      "url" - The URL can link to the code repository, to the software project page, to its documentation, etc. Although very rare, it is possible to have several url component for a software mention.
+      "language" - We only consider here the language when used to indicate how the source code is written, not the language as a broader reference to the programming environment used to develop the mentioned software.
+
+      You will be provided with the text from which the mention was extracted and the mention itself. The mention will be marked in the text with <mention> and </mention> tags.
+      Please extract the additional information about the software mention from the text.
+# System prompt to fill the software mention with additional information. 
+    fill_mention_few_shot: # Few-shot examples for filling the software mention with additional information.
+    - -
+        user
+      - |
+        Extract additional information about the software mention from the text.
+        The text is:
+
+        We used the open-source <mention> Transformers </mention> library developed by Hugging Face (Wolf et al., 2020) to implement and train our models. Our training code MLTrainer is available at https://example.com, the whole code base is implemented using Python.
+
+        Mention to extract additional information about:
+        surface form: Transformers
+    - - assistant
+      - |-
+        {
+            "version": null,
+            "publisher": [
+                {
+                    "surface_form": "Hugging Face",
+                    "context": "developed by Hugging Face (Wolf",
+                }
+            ],
+            "url": [],
+            "language": [
+                {
+                    "surface_form": "Python",
+                    "context": "implemented using Python.",
+                }
+            ]
+        }
+    - - user
+      - |
+        Extract additional information about the software mention from the text.
+        The text is:
+
+        Our solution CryptoSeek is open-source solution for secure communication. The <mention> CryptoSeek </mention> version 1.2.3 developed by SecureSoft is available at https://securesoft.com/cryptoseek. We used Rust to implement it.
+
+        Mention to extract additional information about:
+        surface form: CryptoSeek
+    - - assistant
+      - |-
+        {
+            "version": {
+                "surface_form": "1.2.3",
+                "context": "version 1.2.3"
+            },
+            "publisher": [
+                {
+                    "surface_form": "SecureSoft",
+                    "context": "developed by SecureSoft"
+                }
+            ],
+            "url": [
+                {
+                    "surface_form": "https://securesoft.com/cryptoseek",
+                    "context": "available at https://securesoft.com/cryptoseek"
+                }
+            ],
+            "language": [
+                {
+                    "surface_form": "Rust",
+                    "context": "We used Rust to implement it."
+                }
+            ]
+        }
+    - - user
+      - |
+        Extract additional information about the software mention from the text.
+        The text is:
+
+        In our experiments we focused on high recall methods. The data analysis was performed. We specifically used the tidyverse package to manipulate and visualize the data. 
+
+        Mention to extract additional information about:
+        surface form: tidyverse
+    - - assistant
+      - |-
+        {
+            "version": null,
+            "publisher": [],
+            "url": [],
+            "language": []
+        }
+    fill_mention_prompt: |-
+      Extract additional information about the software mention from the text.
+      The text is:
+
+      {{marked_text}}
+
+      Mention to extract additional information about:
+      surface form: {{mention.surface_form}}
+    verifier: # Verifier to use for verifying the candidates.
+      cls: LocalModelVerifier
+      config:
+        model_factory:  # Model configuration.
+          model_path: SoFairOA/SoFairVerifier # Name or path to the model.
+          attn_implementation: flash_attention_2 # The attention implementation to use in the model (if relevant). Can be any of "eager" (manual implementation of the attention), "sdpa" (using F.scaled_dot_product_attention), or "flash_attention_2" (using Dao-AILab/flash-attention). By default, if available, SDPA will be used for torch>=2.1.1. The default is otherwise the manual "eager" implementation.
+          cache_dir: # Path to Hugging Face cache directory.
+          quantization: # Configuration for bits and bytes quantization.
+            load_in_8bit: false  # This flag is used to enable 8-bit quantization with LLM.int8().
+            load_in_4bit: false # This flag is used to enable 4-bit quantization by replacing the Linear layers with FP4/NF4 layers from `bitsandbytes`.
+            llm_int8_threshold: 6.0 # This corresponds to the outlier threshold for outlier detection as described in `LLM.int8() : 8-bit Matrix Multiplication for Transformers at Scale` paper: https://arxiv.org/abs/2208.07339 Any hidden states value that is above this threshold will be considered an outlier and the operation on those values will be done in fp16. Values are usually normally distributed, that is, most values are in the range [-3.5, 3.5], but there are some exceptional systematic outliers that are very differently distributed for large models. These outliers are often in the interval [-60, -6] or [6, 60]. Int8 quantization works well for values of magnitude ~5, but beyond that, there is a significant performance penalty. A good default threshold is 6, but a lower threshold might be needed for more unstable models (small models, fine-tuning).
+            llm_int8_skip_modules: # An explicit list of the modules that we do not want to convert in 8-bit. This is useful for models such as Jukebox that has several heads in different places and not necessarily at the last position. For example for `CausalLM` models, the last `lm_head` is kept in its original `dtype`.
+            llm_int8_enable_fp32_cpu_offload: false # This flag is used for advanced use cases and users that are aware of this feature. If you want to split your model in different parts and run some parts in int8 on GPU and some parts in fp32 on CPU, you can use this flag. This is useful for offloading large models such as `google/flan-t5-xxl`. Note that the int8 operations will not be run on CPU.
+            llm_int8_has_fp16_weight: false # This flag runs LLM.int8() with 16-bit main weights. This is useful for fine-tuning as the weights do not have to be converted back and forth for the backward pass.
+            bnb_4bit_compute_dtype: # This sets the computational type which might be different than the input type. For example, inputs might be fp32, but computation can be set to bf16 for speedups.
+            bnb_4bit_quant_type: fp4 # This sets the quantization data type in the bnb.nn.Linear4Bit layers. Options are FP4 and NF4 data types which are specified by `fp4` or `nf4`.
+            bnb_4bit_use_double_quant: false # This flag is used for nested quantization where the quantization constants from the first quantization are quantized again.
+            bnb_4bit_quant_storage: # This sets the storage type to pack the quanitzed 4-bit prarams.
+          torch_dtype: bfloat16 # Override the default torch.dtype and load the model under a specific dtype
+          trust_remote_code: false # Whether to trust remote code.
+          device: cuda # Which device to use for the model. If not specified, the model will be loaded on the CPU.
+          config: # Configuration for the model.
+          labels: # Classification labels, the position is specifying label id. Leave empty for automatic detection of labels from dataset or using labels from model configuration.
+        tokenizer: # Hugging Face tokenizer for the model. Leave empty if you wish to initialize it from the model.
+        threshold: # The threshold for the model's confidence probability. Documents with a probability below this threshold will be filtered out. By default, no threshold is applied and a class with the highest probability is selected.
+        batch_size: 32 # Batch size for processing documents.
+        input_template: |-
+          {{marked_input_text}}
+  
+          {% if search_results | length > 0 %}
+          Search results for the target candidate are:
+          {% for r in search_results %}
+          {{r | model_dump_json}}
+          {%endfor %}
+          {% endif %}
+# Jinja2 template for model input.
+# Jinja2 template for the prompt to fill the software mention with additional information. 
+bio_dict: # Dictionary mapping BIO tags to integers. Required if bio_output is True.
+  O: 0
+  B-SOFTWARE: 1
+  I-SOFTWARE: 2
+  B-VERSION: 3
+  I-VERSION: 4
+  B-PUBLISHER: 5
+  I-PUBLISHER: 6
+  B-URL: 7
+  I-URL: 8
+  B-LANGUAGE: 9
+  I-LANGUAGE: 10
+

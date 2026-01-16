@@ -1,3 +1,4 @@
+import logging
 import sys
 import time
 import traceback
@@ -5,7 +6,7 @@ from abc import abstractmethod
 from collections.abc import Iterable
 from typing import Generator
 
-from classconfig import ConfigurableSubclassFactory
+from classconfig import ConfigurableSubclassFactory, ConfigurableValue
 from ollama import Client as OllamaClient
 from openai import OpenAI, APIError, RateLimitError
 
@@ -24,9 +25,14 @@ class API(APIBase):
         voluntary=True,
         user_default=APISQLiteLogger
     )
+    n_tries: int = ConfigurableValue(
+        "Number of tries for each request in case of failure.",
+        user_default=3,
+        voluntary=True
+    )
 
     @abstractmethod
-    def process_single_request(self, request: APIRequest) -> APIOutput:
+    def _process_single_request(self, request: APIRequest) -> APIOutput:
         """
         Processes a single request.
 
@@ -34,6 +40,28 @@ class API(APIBase):
         :return: Processed request
         """
         ...
+
+    def process_single_request(self, request: APIRequest) -> APIOutput:
+        """
+        Processes a single request.
+
+        :param request: Request dictionary.
+        :return: Processed request
+        """
+        exception = None
+        for _attempt in range(self.n_tries):
+            try:
+                return self._process_single_request(request)
+            except Exception as e:
+                logging.info(traceback.format_exc())
+                exception = e
+                continue
+
+        return APIOutput(
+            custom_id=request.custom_id,
+            response=None,
+            error=str(exception)
+        )
 
     def process_requests(self, requests: Iterable[APIRequest]) -> Generator[APIOutput, None, None]:
         """
@@ -66,31 +94,24 @@ class OpenAPI(API):
     def __post_init__(self):
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-    def process_single_request(self, request: APIRequest) -> APIOutput:
-        try:
-            while True:
-                try:
-                    response = self.client.responses.create(**request.body.model_dump(exclude={"type"}))
-                    break
-                except RateLimitError:
-                    print(f"Rate limit reached. Waiting for {self.pool_interval} seconds.", flush=True,
-                          file=sys.stderr)
-                    time.sleep(self.pool_interval)
+    def _process_single_request(self, request: APIRequest) -> APIOutput:
+        while True:
+            try:
+                response = self.client.responses.create(**request.body.model_dump(exclude={"type"}))
+                break
+            except RateLimitError:
+                print(f"Rate limit reached. Waiting for {self.pool_interval} seconds.", flush=True,
+                      file=sys.stderr)
+                time.sleep(self.pool_interval)
 
-            return APIOutput(
-                custom_id=request.custom_id,
-                response=APIResponseOpenAI(
-                    body=response.model_dump(),
-                    structured=request.body.structured
-                ),
-                error=None
-            )
-        except APIError as e:
-            return APIOutput(
-                custom_id=request.custom_id,
-                response=None,
-                error=str(e)
-            )
+        return APIOutput(
+            custom_id=request.custom_id,
+            response=APIResponseOpenAI(
+                body=response.model_dump(),
+                structured=request.body.structured
+            ),
+            error=None
+        )
 
     @classmethod
     def get_request_factory(cls) -> RequestFactory:
@@ -102,29 +123,21 @@ class OllamaAPI(API):
     def __post_init__(self):
         self.client = OllamaClient(host=self.base_url)
 
-    def process_single_request(self, request: APIRequest) -> APIOutput:
-        try:
-            if self.logger is not None:
-                self.logger.log_request(request)
-            response = self.client.chat(**request.body.model_dump(exclude={"type"}))
-            res = APIOutput(
-                custom_id=request.custom_id,
-                response=APIResponseOllama(
-                    body=response,
-                    structured=request.body.structured
-                ),
-                error=None
-            )
-            if self.logger is not None:
-                self.logger.log_response(res)
-            return res
-        except Exception as e:
-            print(traceback.format_exc(), file=sys.stderr, flush=True)
-            return APIOutput(
-                custom_id=request.custom_id,
-                response=None,
-                error=str(e)
-            )
+    def _process_single_request(self, request: APIRequest) -> APIOutput:
+        if self.logger is not None:
+            self.logger.log_request(request)
+        response = self.client.chat(**request.body.model_dump(exclude={"type"}))
+        res = APIOutput(
+            custom_id=request.custom_id,
+            response=APIResponseOllama(
+                body=response,
+                structured=request.body.structured
+            ),
+            error=None
+        )
+        if self.logger is not None:
+            self.logger.log_response(res)
+        return res
 
     @classmethod
     def get_request_factory(cls) -> RequestFactory:

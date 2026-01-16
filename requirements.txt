@@ -12,3 +12,4 @@ whitespacetokenizer
 pyahocorasick
 torch
 transformers
+tiktoken
