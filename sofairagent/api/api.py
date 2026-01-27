@@ -89,29 +89,45 @@ class API(APIBase):
 class OpenAPI(API):
     """
     Handles requests to the OpenAI API.
+
+    WARNING! This is not tested implementation.
     """
 
     def __post_init__(self):
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
     def _process_single_request(self, request: APIRequest) -> APIOutput:
+        if self.logger is not None:
+            self.logger.log_request(request)
         while True:
             try:
-                response = self.client.responses.create(**request.body.model_dump(exclude={"type"}))
+                args = request.body.model_dump(exclude={"type"})
+                if args["tools"] is None:
+                    args.pop("tools")
+
+                if request.body.structured:
+                    response = self.client.chat.completions.parse(**args)
+                else:
+                    response = self.client.chat.completions.create(**args)
                 break
             except RateLimitError:
                 print(f"Rate limit reached. Waiting for {self.pool_interval} seconds.", flush=True,
                       file=sys.stderr)
                 time.sleep(self.pool_interval)
 
-        return APIOutput(
+        res = APIOutput(
             custom_id=request.custom_id,
             response=APIResponseOpenAI(
-                body=response.model_dump(),
+                body=response,
                 structured=request.body.structured
             ),
             error=None
         )
+
+        if self.logger is not None:
+            self.logger.log_response(res)
+
+        return res
 
     @classmethod
     def get_request_factory(cls) -> RequestFactory:

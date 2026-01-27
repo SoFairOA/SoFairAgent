@@ -1,6 +1,6 @@
 classconfig~=1.0.11
 ollama
-openai
+openai~=1.101.0
 pydantic
 json-repair
 intervaltree

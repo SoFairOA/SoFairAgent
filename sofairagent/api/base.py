@@ -7,6 +7,7 @@ from classconfig import ConfigurableValue, ConfigurableMixin
 from classconfig.validators import StringValidator, MinValueIntegerValidator
 from ollama import ChatResponse
 from openai import NotGiven, NOT_GIVEN
+from openai.types.chat import ChatCompletion
 from openai.types.responses import Response
 from pydantic import BaseModel, Field
 from ruamel.yaml.scalarstring import LiteralScalarString
@@ -58,7 +59,7 @@ class OpenAIAPIRequestBody(APIRequestBody):
     temperature: Optional[float]  # Temperature for the model
     logprobs: Optional[bool]  # Whether to return log probabilities
     max_completion_tokens: Optional[int]  # Maximum number of tokens to generate
-    response_format: Optional[BaseModel]  # Format of the response, if any
+    response_format: dict | Type[BaseModel] | None  # Format of the response, if any
     tools: Optional[list[dict]]  # Defines tools for the model, if any
 
     @property
@@ -138,27 +139,16 @@ class APIResponse(BaseModel, ABC):
 
 class APIResponseOpenAI(APIResponse):
     type: Literal["openai"] = "openai"
-    body: Response
+    body: ChatCompletion
 
     def get_raw_content(self) -> str:
-        return self.body.output_text
+        return self.body.choices[0].message.content
 
     def get_function_calls(self) -> list[FunctionCall]:
-        calls = []
-        for o in self.body.output:
-            if o.message.tool_calls:
-                for call in o.message.tool_calls:
-                    name = call.function.name
-                    arguments = call.function.arguments
-                    arguments = json_repair.loads(arguments)
-                    calls.append(FunctionCall(name=name, arguments=arguments))
-        return calls
+        raise NotImplementedError("Function call extraction is not implemented for OpenAI responses.")
 
     def get_reasoning_trace(self) -> Optional[str]:
-        for o in self.body.output:
-            if o.type == "reasoning":
-                return o.content
-        return None
+        raise NotImplementedError("Reasoning trace extraction is not implemented for OpenAI responses.")
 
     def to_message_dict(self) -> dict:
         raise NotImplementedError("Conversion to message dict is not implemented for OpenAI responses.")
