@@ -5,7 +5,7 @@ agent:  # Agent for extraction.
       cls: OllamaAPI  # name of class that is subclass of API
       config: # configuration for defined class
         api_key: ollama  # API key.
-        base_url: http://athena19.fit.vutbr.cz:11431 # Base URL for API.
+        base_url:  # Base URL for API.
         pool_interval: 300 # Interval in seconds for checking the status of the batch request.
         process_requests_interval: 1 # Interval in seconds between sending requests when processed synchronously.
         logger: # Logger for API requests and responses.
